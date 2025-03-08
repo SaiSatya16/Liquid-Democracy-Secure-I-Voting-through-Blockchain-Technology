@@ -1,0 +1,60 @@
+AES Payload Size Performance Analysis
+==================================================
+
+
+AES-128 Performance:
+------------------------------
+
+Payload Size: 1.0KB
+Average Computation Time: 0.031 ms
+Standard Deviation: 0.003 ms
+
+Payload Size: 10.0KB
+Average Computation Time: 0.087 ms
+Standard Deviation: 0.004 ms
+
+Payload Size: 100.0KB
+Average Computation Time: 0.657 ms
+Standard Deviation: 0.021 ms
+
+Payload Size: 1024.0KB
+Average Computation Time: 6.470 ms
+Standard Deviation: 0.103 ms
+
+AES-192 Performance:
+------------------------------
+
+Payload Size: 1.0KB
+Average Computation Time: 0.031 ms
+Standard Deviation: 0.002 ms
+
+Payload Size: 10.0KB
+Average Computation Time: 0.091 ms
+Standard Deviation: 0.001 ms
+
+Payload Size: 100.0KB
+Average Computation Time: 0.698 ms
+Standard Deviation: 0.004 ms
+
+Payload Size: 1024.0KB
+Average Computation Time: 7.097 ms
+Standard Deviation: 0.234 ms
+
+AES-256 Performance:
+------------------------------
+
+Payload Size: 1.0KB
+Average Computation Time: 0.032 ms
+Standard Deviation: 0.001 ms
+
+Payload Size: 10.0KB
+Average Computation Time: 0.097 ms
+Standard Deviation: 0.001 ms
+
+Payload Size: 100.0KB
+Average Computation Time: 0.755 ms
+Standard Deviation: 0.008 ms
+
+Payload Size: 1024.0KB
+Average Computation Time: 7.674 ms
+Standard Deviation: 0.213 ms

@@ -1,0 +1,72 @@
+AES Text Size Analysis Report
+==================================================
+
+
+AES-128 Analysis:
+------------------------------
+
+Original Size: 64 bytes
+Average Plaintext Size: 64.0 bytes
+Average Ciphertext Size: 96.0 bytes
+Overhead Percentage: 50.00%
+
+Original Size: 256 bytes
+Average Plaintext Size: 256.0 bytes
+Average Ciphertext Size: 288.0 bytes
+Overhead Percentage: 12.50%
+
+Original Size: 1024 bytes
+Average Plaintext Size: 1024.0 bytes
+Average Ciphertext Size: 1056.0 bytes
+Overhead Percentage: 3.12%
+
+Original Size: 4096 bytes
+Average Plaintext Size: 4096.0 bytes
+Average Ciphertext Size: 4128.0 bytes
+Overhead Percentage: 0.78%
+
+AES-192 Analysis:
+------------------------------
+
+Original Size: 64 bytes
+Average Plaintext Size: 64.0 bytes
+Average Ciphertext Size: 96.0 bytes
+Overhead Percentage: 50.00%
+
+Original Size: 256 bytes
+Average Plaintext Size: 256.0 bytes
+Average Ciphertext Size: 288.0 bytes
+Overhead Percentage: 12.50%
+
+Original Size: 1024 bytes
+Average Plaintext Size: 1024.0 bytes
+Average Ciphertext Size: 1056.0 bytes
+Overhead Percentage: 3.12%
+
+Original Size: 4096 bytes
+Average Plaintext Size: 4096.0 bytes
+Average Ciphertext Size: 4128.0 bytes
+Overhead Percentage: 0.78%
+
+AES-256 Analysis:
+------------------------------
+
+Original Size: 64 bytes
+Average Plaintext Size: 64.0 bytes
+Average Ciphertext Size: 96.0 bytes
+Overhead Percentage: 50.00%
+
+Original Size: 256 bytes
+Average Plaintext Size: 256.0 bytes
+Average Ciphertext Size: 288.0 bytes
+Overhead Percentage: 12.50%
+
+Original Size: 1024 bytes
+Average Plaintext Size: 1024.0 bytes
+Average Ciphertext Size: 1056.0 bytes
+Overhead Percentage: 3.12%
+
+Original Size: 4096 bytes
+Average Plaintext Size: 4096.0 bytes
+Average Ciphertext Size: 4128.0 bytes
+Overhead Percentage: 0.78%

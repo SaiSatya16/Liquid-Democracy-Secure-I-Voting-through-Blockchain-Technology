@@ -1,0 +1,72 @@
+AES Bit Change Analysis Report
+==================================================
+
+
+AES-128 Analysis:
+------------------------------
+
+Bits Changed in Key: 10
+Average Bit Change in Ciphertext: 50.07%
+Standard Deviation: 0.52%
+
+Bits Changed in Key: 20
+Average Bit Change in Ciphertext: 49.95%
+Standard Deviation: 0.60%
+
+Bits Changed in Key: 30
+Average Bit Change in Ciphertext: 49.98%
+Standard Deviation: 0.65%
+
+Bits Changed in Key: 40
+Average Bit Change in Ciphertext: 49.96%
+Standard Deviation: 0.59%
+
+Bits Changed in Key: 50
+Average Bit Change in Ciphertext: 49.94%
+Standard Deviation: 0.57%
+
+AES-192 Analysis:
+------------------------------
+
+Bits Changed in Key: 10
+Average Bit Change in Ciphertext: 49.97%
+Standard Deviation: 0.55%
+
+Bits Changed in Key: 20
+Average Bit Change in Ciphertext: 50.09%
+Standard Deviation: 0.57%
+
+Bits Changed in Key: 30
+Average Bit Change in Ciphertext: 50.08%
+Standard Deviation: 0.60%
+
+Bits Changed in Key: 40
+Average Bit Change in Ciphertext: 50.01%
+Standard Deviation: 0.54%
+
+Bits Changed in Key: 50
+Average Bit Change in Ciphertext: 49.73%
+Standard Deviation: 0.49%
+
+AES-256 Analysis:
+------------------------------
+
+Bits Changed in Key: 10
+Average Bit Change in Ciphertext: 50.00%
+Standard Deviation: 0.54%
+
+Bits Changed in Key: 20
+Average Bit Change in Ciphertext: 50.14%
+Standard Deviation: 0.57%
+
+Bits Changed in Key: 30
+Average Bit Change in Ciphertext: 49.91%
+Standard Deviation: 0.52%
+
+Bits Changed in Key: 40
+Average Bit Change in Ciphertext: 50.04%
+Standard Deviation: 0.55%
+
+Bits Changed in Key: 50
+Average Bit Change in Ciphertext: 49.97%
+Standard Deviation: 0.49%

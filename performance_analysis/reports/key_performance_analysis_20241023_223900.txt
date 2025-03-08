@@ -1,0 +1,93 @@
+AES Performance Analysis Report
+==================================================
+
+
+AES-128 Performance Metrics:
+------------------------------
+
+Data Size: 1.0KB
+Average Encryption Time: 0.04 ms
+Average Decryption Time: 0.04 ms
+Average Throughput: 13.70 MB/s
+Average Memory Usage: 65.11 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.05 ms
+Std Dev (Decryption): 0.01 ms
+
+Data Size: 10.0KB
+Average Encryption Time: 0.09 ms
+Average Decryption Time: 0.10 ms
+Average Throughput: 51.81 MB/s
+Average Memory Usage: 65.11 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.01 ms
+Std Dev (Decryption): 0.00 ms
+
+Data Size: 100.0KB
+Average Encryption Time: 0.65 ms
+Average Decryption Time: 0.66 ms
+Average Throughput: 74.56 MB/s
+Average Memory Usage: 65.40 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.02 ms
+Std Dev (Decryption): 0.01 ms
+
+AES-192 Performance Metrics:
+------------------------------
+
+Data Size: 1.0KB
+Average Encryption Time: 0.03 ms
+Average Decryption Time: 0.04 ms
+Average Throughput: 13.84 MB/s
+Average Memory Usage: 65.58 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.00 ms
+Std Dev (Decryption): 0.00 ms
+
+Data Size: 10.0KB
+Average Encryption Time: 0.10 ms
+Average Decryption Time: 0.10 ms
+Average Throughput: 49.44 MB/s
+Average Memory Usage: 65.59 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.00 ms
+Std Dev (Decryption): 0.01 ms
+
+Data Size: 100.0KB
+Average Encryption Time: 0.71 ms
+Average Decryption Time: 0.71 ms
+Average Throughput: 68.67 MB/s
+Average Memory Usage: 65.61 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.01 ms
+Std Dev (Decryption): 0.02 ms
+
+AES-256 Performance Metrics:
+------------------------------
+
+Data Size: 1.0KB
+Average Encryption Time: 0.03 ms
+Average Decryption Time: 0.04 ms
+Average Throughput: 13.31 MB/s
+Average Memory Usage: 65.61 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.00 ms
+Std Dev (Decryption): 0.00 ms
+
+Data Size: 10.0KB
+Average Encryption Time: 0.10 ms
+Average Decryption Time: 0.11 ms
+Average Throughput: 45.88 MB/s
+Average Memory Usage: 65.61 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.01 ms
+Std Dev (Decryption): 0.01 ms
+
+Data Size: 100.0KB
+Average Encryption Time: 0.79 ms
+Average Decryption Time: 0.80 ms
+Average Throughput: 61.67 MB/s
+Average Memory Usage: 65.69 MB
+Average CPU Usage: 0.00%
+Std Dev (Encryption): 0.04 ms
+Std Dev (Decryption): 0.08 ms

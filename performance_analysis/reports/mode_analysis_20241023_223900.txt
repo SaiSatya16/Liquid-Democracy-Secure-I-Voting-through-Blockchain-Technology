@@ -1,0 +1,108 @@
+AES Mode Performance Analysis Report
+==================================================
+
+
+ECB Mode Performance:
+------------------------------
+
+AES-128:
+Average Encryption Time: 0.008 ms
+Average Decryption Time: 0.007 ms
+Encryption Time Std Dev: 0.004 ms
+Average Memory Usage: 106.05 MB
+
+AES-192:
+Average Encryption Time: 0.008 ms
+Average Decryption Time: 0.008 ms
+Encryption Time Std Dev: 0.000 ms
+Average Memory Usage: 106.05 MB
+
+AES-256:
+Average Encryption Time: 0.009 ms
+Average Decryption Time: 0.008 ms
+Encryption Time Std Dev: 0.000 ms
+Average Memory Usage: 106.05 MB
+
+CBC Mode Performance:
+------------------------------
+
+AES-128:
+Average Encryption Time: 0.009 ms
+Average Decryption Time: 0.008 ms
+Encryption Time Std Dev: 0.003 ms
+Average Memory Usage: 106.05 MB
+
+AES-192:
+Average Encryption Time: 0.009 ms
+Average Decryption Time: 0.008 ms
+Encryption Time Std Dev: 0.001 ms
+Average Memory Usage: 106.05 MB
+
+AES-256:
+Average Encryption Time: 0.010 ms
+Average Decryption Time: 0.009 ms
+Encryption Time Std Dev: 0.000 ms
+Average Memory Usage: 106.05 MB
+
+CFB Mode Performance:
+------------------------------
+
+AES-128:
+Average Encryption Time: 0.056 ms
+Average Decryption Time: 0.055 ms
+Encryption Time Std Dev: 0.003 ms
+Average Memory Usage: 106.05 MB
+
+AES-192:
+Average Encryption Time: 0.064 ms
+Average Decryption Time: 0.063 ms
+Encryption Time Std Dev: 0.001 ms
+Average Memory Usage: 106.05 MB
+
+AES-256:
+Average Encryption Time: 0.073 ms
+Average Decryption Time: 0.072 ms
+Encryption Time Std Dev: 0.001 ms
+Average Memory Usage: 106.05 MB
+
+CTR Mode Performance:
+------------------------------
+
+AES-128:
+Average Encryption Time: 0.009 ms
+Average Decryption Time: 0.008 ms
+Encryption Time Std Dev: 0.003 ms
+Average Memory Usage: 106.05 MB
+
+AES-192:
+Average Encryption Time: 0.009 ms
+Average Decryption Time: 0.009 ms
+Encryption Time Std Dev: 0.001 ms
+Average Memory Usage: 106.05 MB
+
+AES-256:
+Average Encryption Time: 0.010 ms
+Average Decryption Time: 0.010 ms
+Encryption Time Std Dev: 0.000 ms
+Average Memory Usage: 106.05 MB
+
+GCM Mode Performance:
+------------------------------
+
+AES-128:
+Average Encryption Time: 0.031 ms
+Average Decryption Time: 0.039 ms
+Encryption Time Std Dev: 0.004 ms
+Average Memory Usage: 106.05 MB
+
+AES-192:
+Average Encryption Time: 0.032 ms
+Average Decryption Time: 0.039 ms
+Encryption Time Std Dev: 0.002 ms
+Average Memory Usage: 106.05 MB
+
+AES-256:
+Average Encryption Time: 0.033 ms
+Average Decryption Time: 0.040 ms
+Encryption Time Std Dev: 0.001 ms
+Average Memory Usage: 106.05 MB

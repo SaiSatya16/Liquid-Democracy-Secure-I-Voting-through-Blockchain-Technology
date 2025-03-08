@@ -1,0 +1,145 @@
+AES Comprehensive Performance Analysis
+==================================================
+
+Analysis Date: 2024-10-23 22:39:02
+
+Summary of Results:
+
+1. Key Performance Analysis:
+--------------------
+
+AES-128:
+  1.0KB:
+    Encryption: 0.038 ms
+    Decryption: 0.039 ms
+    Throughput: 13.70 MB/s
+  10.0KB:
+    Encryption: 0.091 ms
+    Decryption: 0.098 ms
+    Throughput: 51.81 MB/s
+  100.0KB:
+    Encryption: 0.653 ms
+    Decryption: 0.657 ms
+    Throughput: 74.56 MB/s
+
+AES-192:
+  1.0KB:
+    Encryption: 0.032 ms
+    Decryption: 0.039 ms
+    Throughput: 13.84 MB/s
+  10.0KB:
+    Encryption: 0.095 ms
+    Decryption: 0.103 ms
+    Throughput: 49.44 MB/s
+  100.0KB:
+    Encryption: 0.708 ms
+    Decryption: 0.714 ms
+    Throughput: 68.67 MB/s
+
+AES-256:
+  1.0KB:
+    Encryption: 0.033 ms
+    Decryption: 0.040 ms
+    Throughput: 13.31 MB/s
+  10.0KB:
+    Encryption: 0.103 ms
+    Decryption: 0.111 ms
+    Throughput: 45.88 MB/s
+  100.0KB:
+    Encryption: 0.789 ms
+    Decryption: 0.800 ms
+    Throughput: 61.67 MB/s
+
+2. Mode Analysis:
+--------------------
+
+ECB:
+  AES-128: 0.008 ms
+  AES-192: 0.008 ms
+  AES-256: 0.009 ms
+
+CBC:
+  AES-128: 0.009 ms
+  AES-192: 0.009 ms
+  AES-256: 0.010 ms
+
+CFB:
+  AES-128: 0.056 ms
+  AES-192: 0.064 ms
+  AES-256: 0.073 ms
+
+CTR:
+  AES-128: 0.009 ms
+  AES-192: 0.009 ms
+  AES-256: 0.010 ms
+
+GCM:
+  AES-128: 0.031 ms
+  AES-192: 0.032 ms
+  AES-256: 0.033 ms
+
+3. Payload Analysis:
+--------------------
+
+AES-128:
+  1.0KB: 0.031 ms
+  10.0KB: 0.087 ms
+  100.0KB: 0.657 ms
+  1024.0KB: 6.470 ms
+
+AES-192:
+  1.0KB: 0.031 ms
+  10.0KB: 0.091 ms
+  100.0KB: 0.698 ms
+  1024.0KB: 7.097 ms
+
+AES-256:
+  1.0KB: 0.032 ms
+  10.0KB: 0.097 ms
+  100.0KB: 0.755 ms
+  1024.0KB: 7.674 ms
+
+4. Text Size Analysis:
+--------------------
+
+AES-128:
+  64 bytes: 50.00% overhead
+  256 bytes: 12.50% overhead
+  1024 bytes: 3.12% overhead
+  4096 bytes: 0.78% overhead
+
+AES-192:
+  64 bytes: 50.00% overhead
+  256 bytes: 12.50% overhead
+  1024 bytes: 3.12% overhead
+  4096 bytes: 0.78% overhead
+
+AES-256:
+  64 bytes: 50.00% overhead
+  256 bytes: 12.50% overhead
+  1024 bytes: 3.12% overhead
+  4096 bytes: 0.78% overhead
+
+5. Bit Change Analysis:
+--------------------
+
+AES-128:
+  10 bits: 50.07% change
+  20 bits: 49.95% change
+  30 bits: 49.98% change
+  40 bits: 49.96% change
+  50 bits: 49.94% change
+
+AES-192:
+  10 bits: 49.97% change
+  20 bits: 50.09% change
+  30 bits: 50.08% change
+  40 bits: 50.01% change
+  50 bits: 49.73% change
+
+AES-256:
+  10 bits: 50.00% change
+  20 bits: 50.14% change
+  30 bits: 49.91% change
+  40 bits: 50.04% change
+  50 bits: 49.97% change
