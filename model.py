@@ -83,8 +83,9 @@ class Vote(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     scheme_id = db.Column(db.Integer, db.ForeignKey('scheme.id'))
-    vote = db.Column(db.String(32), nullable=False)
-    key_secret_name = db.Column(db.String(255), nullable=False)
+    vote = db.Column(db.String(255), nullable=False)  # Changed to store base64 encoded ciphertext
+    encryption_key = db.relationship('EncryptionKey', backref='vote', uselist=False)
+
 
 class Usercurrentvote(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -97,4 +98,11 @@ class Delegation(db.Model):
     delegator_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     delegatee_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     scheme_id = db.Column(db.Integer, db.ForeignKey('scheme.id'), nullable=False)
+
+class EncryptionKey(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    vote_id = db.Column(db.Integer, db.ForeignKey('vote.id'))
+    encrypted_key = db.Column(db.LargeBinary, nullable=False)
+    nonce = db.Column(db.LargeBinary, nullable=False)
+    tag = db.Column(db.LargeBinary, nullable=False)
 

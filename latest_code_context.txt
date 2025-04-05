@@ -1,0 +1,2699 @@
+// File: api.py
+# api.py
+from flask_restful import Resource, Api, fields, marshal_with, reqparse
+from model import *
+from werkzeug.exceptions import HTTPException
+from flask_cors import CORS
+import json
+from flask import make_response, request
+from flask_security import auth_required, roles_required
+import os
+from functools import wraps
+from flask import abort
+from flask_security import roles_accepted
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+import base64
+import boto3 
+from Crypto.Util.Padding import unpad
+import numpy as np
+from botocore.exceptions import ClientError
+from blockchain_service import BlockchainService
+from web3 import Web3
+from blockchain_config import w3
+
+api = Api()
+
+def any_role_required(*roles):
+    def wrapper(fn):
+        @wraps(fn)
+        def decorator(*args, **kwargs):
+            if not roles_accepted(*roles):
+                abort(403, description="Insufficient permissions")
+            return fn(*args, **kwargs)
+        return decorator
+    return wrapper
+
+#==========================Validation========================================================
+class NotFoundError(HTTPException):
+    def __init__(self,status_code):
+        message = {"error_code":"BE1009","error_message":"Not Found"}
+        self.response = make_response(json.dumps(message), status_code)
+
+class BusinessValidationError(HTTPException):
+    def __init__(self, status_code, error_code, error_message):
+        message = {"error_code":error_code,"error_message":error_message}
+        self.response = make_response(json.dumps(message), status_code)
+
+
+#==============================output fields========================================
+scheme_fields = {
+    'id': fields.Integer,
+    'name': fields.String,
+    'description': fields.String
+}
+
+vote_filelds = {
+    'id': fields.Integer,
+    'user_id': fields.Integer,
+    'scheme_id': fields.Integer,
+    'vote': fields.Boolean
+}
+
+#====================Create Scheme and Votes request pares=======================================
+create_scheme_parser = reqparse.RequestParser()
+create_scheme_parser.add_argument('name')
+create_scheme_parser.add_argument('description')
+
+create_vote_parser = reqparse.RequestParser()
+create_vote_parser.add_argument('user_id')
+create_vote_parser.add_argument('scheme_id')
+create_vote_parser.add_argument('vote')
+
+#====================Update Scheme and Votes request pares=======================================
+update_scheme_parser = reqparse.RequestParser()
+update_scheme_parser.add_argument('name')
+update_scheme_parser.add_argument('description')
+
+update_vote_parser = reqparse.RequestParser()
+update_vote_parser.add_argument('user_id')
+update_vote_parser.add_argument('scheme_id')
+update_vote_parser.add_argument('vote')
+
+class SecureVoting:
+    def __init__(self):
+        # Use a constant master key for simplicity - in production, use a more secure approach
+        # This should be stored securely, possibly as an environment variable
+        self.master_key = os.environ.get('MASTER_KEY', 'ThisIsA32ByteMasterKeyForEncryption').encode()[:32]
+        
+    def generate_data_key(self):
+        # Generate a random data key
+        data_key = get_random_bytes(32)
+        
+        # Encrypt the data key with the master key
+        cipher = AES.new(self.master_key, AES.MODE_GCM)
+        encrypted_key, tag = cipher.encrypt_and_digest(data_key)
+        
+        return data_key, encrypted_key, cipher.nonce, tag
+        
+    def encrypt_vote(self, vote_value):
+        # Generate and encrypt a data key
+        data_key, encrypted_key, nonce, tag = self.generate_data_key()
+        
+        # Use the data key to encrypt the vote
+        vote_cipher = AES.new(data_key, AES.MODE_GCM)
+        vote_ciphertext, vote_tag = vote_cipher.encrypt_and_digest(vote_value.encode())
+        
+        # Combine the encrypted vote components for storage
+        encrypted_vote = base64.b64encode(vote_cipher.nonce + vote_tag + vote_ciphertext).decode()
+        
+        return encrypted_vote, encrypted_key, nonce, tag
+        
+    def decrypt_vote(self, encrypted_vote, encrypted_key, nonce, tag):
+        try:
+            # Decrypt the data key using the master key
+            cipher = AES.new(self.master_key, AES.MODE_GCM, nonce=nonce)
+            data_key = cipher.decrypt_and_verify(encrypted_key, tag)
+            
+            # Decrypt the vote using the data key
+            encrypted_data = base64.b64decode(encrypted_vote)
+            vote_nonce = encrypted_data[:16]
+            vote_tag = encrypted_data[16:32]
+            vote_ciphertext = encrypted_data[32:]
+            
+            vote_cipher = AES.new(data_key, AES.MODE_GCM, nonce=vote_nonce)
+            decrypted_vote = vote_cipher.decrypt_and_verify(vote_ciphertext, vote_tag)
+            
+            return decrypted_vote.decode()
+        except Exception as e:
+            print(f"Error decrypting vote: {e}")
+            raise
+
+class SchemeApi(Resource):
+    def __init__(self):
+        self.secure_voting = SecureVoting()
+        self.blockchain_service = BlockchainService()
+
+    @auth_required('token')
+    @any_role_required('admin', 'voter')
+    def get(self, id):
+        data = []
+        schemes = Scheme.query.all()
+
+        for scheme in schemes:
+            allowed_to_vote = False
+            usercurrentvote_count = 0
+            usercurrentvote = Usercurrentvote.query.filter_by(user_id=id, scheme_id=scheme.id).first()
+            usercurrentvote_count = Usercurrentvote.query.filter_by(user_id=id, scheme_id=scheme.id).count()
+
+            if usercurrentvote:
+                allowed_to_vote = True
+
+            # Get vote counts from blockchain
+            true_vote_count, false_vote_count, success, error = self.blockchain_service.get_vote_count(scheme.id)
+            
+            if not success:
+                # Fallback to database if blockchain call fails
+                true_vote_count = 0
+                false_vote_count = 0
+                
+                # Calculate true and false vote count from database
+                for vote in scheme.votes:
+                    try:
+                        if vote.encryption_key:
+                            decrypted_vote = self.secure_voting.decrypt_vote(
+                                vote.vote, 
+                                vote.encryption_key.encrypted_key,
+                                vote.encryption_key.nonce,
+                                vote.encryption_key.tag
+                            )
+                            if decrypted_vote == 'true':
+                                true_vote_count += 1
+                            elif decrypted_vote == 'false':
+                                false_vote_count += 1
+                    except Exception as e:
+                        print(f"Error decrypting vote {vote.id}: {e}")
+
+            total_votes = true_vote_count + false_vote_count
+
+            true_vote_percentage = 0
+            false_vote_percentage = 0
+            if total_votes > 0:
+                true_vote_percentage = round((true_vote_count / total_votes) * 100, 2)
+                false_vote_percentage = round((false_vote_count / total_votes) * 100, 2)
+
+            delegation = Delegation.query.filter_by(delegator_id=id, scheme_id=scheme.id).first()
+            delegated_to = None
+            if delegation:
+                delegatee = User.query.get(delegation.delegatee_id)
+                delegated_to = {
+                    'id': delegatee.id,
+                    'username': delegatee.username
+                }
+
+            not_delegated_users = User.query.filter(User.roles.any(Role.name == 'Voter'))\
+                .filter(~User.id.in_(db.session.query(Delegation.delegator_id)\
+                .filter(Delegation.scheme_id == scheme.id)))\
+                .filter(~User.id.in_(db.session.query(Vote.user_id)\
+                .filter(Vote.scheme_id == scheme.id)))\
+                .filter(User.id != id)\
+                .all()
+
+            # Get user weight from blockchain
+            user = User.query.get(id)
+            user_address = f"0x{id:040x}"  # Create a dummy Ethereum address from user ID
+            user_weight, success, error = self.blockchain_service.get_voter_weight(user_address, scheme.id)
+            
+            if not success:
+                # Fallback to database calculation
+                user_weight = user.calculate_weight(scheme.id)
+            
+            # Calculate delegation chain
+            chain = []
+            current_user = user
+            while True:
+                delegation = Delegation.query.filter_by(delegator_id=current_user.id, scheme_id=scheme.id).first()
+                if delegation:
+# api.py (continued)
+                    delegatee = User.query.get(delegation.delegatee_id)
+                    chain.append(delegatee.username)
+                    current_user = delegatee
+                else:
+                    break
+            
+            delegation_chain_length = len(chain)
+
+            # Calculate Gini coefficient
+            all_weights = [u.calculate_weight(scheme.id) for u in User.query.filter(User.roles.any(Role.name == 'Voter')).all()]
+            gini_coefficient = self.calculate_gini(all_weights)
+
+            data.append({
+                'id': scheme.id,
+                'name': scheme.name,
+                'description': scheme.description,
+                'allowed_to_vote': allowed_to_vote,
+                'true_vote_percentage': true_vote_percentage,
+                'false_vote_percentage': false_vote_percentage,
+                'true_vote_count': true_vote_count,
+                'false_vote_count': false_vote_count,
+                'usercurrentvote_count': usercurrentvote_count,
+                'not_delegated_users': [{'id': user.id, 'username': user.username} for user in not_delegated_users],
+                'delegated_to': delegated_to,
+                'userWeight': user_weight,
+                'delegationChainLength': delegation_chain_length,
+                'giniCoefficient': gini_coefficient,
+                'blockchain_verified': success  # Add blockchain verification status
+            })
+
+        return data
+
+    def calculate_gini(self, weights):
+        sorted_weights = sorted(weights)
+        height, area = 0, 0
+        for weight in sorted_weights:
+            height += weight
+            area += height - weight / 2.
+        fair_area = height * len(weights) / 2.
+        return (fair_area - area) / fair_area
+    
+    @marshal_with(scheme_fields)
+    @auth_required('token')
+    @any_role_required('admin')
+    def post(self):
+        args = create_scheme_parser.parse_args()
+        name = args.get('name', None)
+        description = args.get('description', None)
+        if not name:
+            raise BusinessValidationError(400, "BE1001", "Name is required")
+        if not description:
+            raise BusinessValidationError(400, "BE1002", "Description is required")
+        
+        # Create scheme in blockchain
+        scheme_id, success, error = self.blockchain_service.create_scheme(name, description)
+        
+        if not success:
+            raise BusinessValidationError(500, "BE1010", f"Blockchain error: {error}")
+        
+        # Create scheme in database
+        scheme = Scheme(name=name, description=description)
+        db.session.add(scheme)
+        db.session.commit()
+        
+        scheme = Scheme.query.filter_by(name=name).first()
+        s_id = scheme.id
+        
+        # Query only users with role voter
+        users = User.query.filter(User.roles.any(Role.name == 'Voter')).all()
+        for user in users:
+            usercurrentvote = Usercurrentvote(user_id=user.id, scheme_id=s_id, vote=None)
+            db.session.add(usercurrentvote)
+        db.session.commit()
+        return scheme
+class VoteApi(Resource):
+    def __init__(self):
+        self.secure_voting = SecureVoting()
+        self.blockchain_service = BlockchainService()
+
+    @marshal_with(vote_filelds)
+    @auth_required('token')
+    @any_role_required('voter')
+    def post(self):
+        args = create_vote_parser.parse_args()
+        user_id = args.get('user_id', None)
+        scheme_id = args.get('scheme_id', None)
+        vote_value = args.get('vote', None)
+        
+        if not user_id:
+            raise BusinessValidationError(400, "BE1003", "User id is required")
+        if not scheme_id:
+            raise BusinessValidationError(400, "BE1004", "Scheme id is required")
+        if vote_value is None:
+            raise BusinessValidationError(400, "BE1005", "Vote is required")
+        
+        # Convert vote to boolean for blockchain
+        vote_bool = vote_value.lower() == 'true'
+        
+        # Create Ethereum address from user ID (in a real app, users would have real addresses)
+        user_address = f"0x{int(user_id):040x}"
+        
+        # Submit vote to blockchain
+        success, error = self.blockchain_service.cast_vote(user_address, scheme_id, vote_bool)
+        
+        if not success:
+            # If blockchain fails, continue with database only but log the error
+            print(f"Blockchain voting failed: {error}")
+        
+        user_current_votes_count = Usercurrentvote.query.filter_by(user_id=user_id, scheme_id=scheme_id).count()
+        last_vote = None
+        
+        for i in range(user_current_votes_count):
+            # Encrypt the vote
+            encrypted_vote, encrypted_key, nonce, tag = self.secure_voting.encrypt_vote(vote_value)
+            
+            # Create and save the vote
+            vote_obj = Vote(user_id=user_id, scheme_id=scheme_id, vote=encrypted_vote)
+            db.session.add(vote_obj)
+            db.session.flush()  # Flush to get the vote ID
+            
+            # Create and save the encryption key
+            key_obj = EncryptionKey(
+                vote_id=vote_obj.id,
+                encrypted_key=encrypted_key,
+                nonce=nonce,
+                tag=tag
+            )
+            db.session.add(key_obj)
+            last_vote = vote_obj
+        
+        # Delete all the entries from usercurrentvote table
+        user_current_votes = Usercurrentvote.query.filter_by(user_id=user_id, scheme_id=scheme_id).all()
+        for user_current_vote in user_current_votes:
+            db.session.delete(user_current_vote)
+        
+        db.session.commit()
+        return last_vote
+class DelegationApi(Resource):
+    def __init__(self):
+        self.parser = reqparse.RequestParser()
+        self.parser.add_argument('delegator_id', type=int, required=True, help='Delegator user ID is required')
+        self.parser.add_argument('delegatee_id', type=int, required=True, help='Delegatee user ID is required')
+        self.parser.add_argument('scheme_id', type=int, required=True, help='Scheme ID is required')
+        self.blockchain_service = BlockchainService()
+
+    @auth_required('token')
+    def post(self):
+        args = self.parser.parse_args()
+        delegator_id = args['delegator_id']
+        delegatee_id = args['delegatee_id']
+        scheme_id = args['scheme_id']
+
+        delegator = User.query.get(delegator_id)
+        delegatee = User.query.get(delegatee_id)
+        scheme = Scheme.query.get(scheme_id)
+
+        if not delegator or not delegatee or not scheme:
+            return {'error_message': 'Invalid user ID(s) or scheme ID'}, 400
+            
+        if delegator.is_delegating_to(delegatee, scheme_id):
+            return {'error_message': 'Delegation already exists for this scheme'}, 400
+        
+        existing_delegation = Delegation.query.filter_by(delegator_id=delegatee_id, delegatee_id=delegator_id, scheme_id=scheme_id).first()
+        if existing_delegation:
+            return {'error_message': 'Cannot delegate to a user who has already delegated to you for this scheme'}, 400
+
+        # Create Ethereum addresses from user IDs
+        delegator_address = f"0x{delegator_id:040x}"
+        delegatee_address = f"0x{delegatee_id:040x}"
+        
+        # Submit delegation to blockchain
+        success, error = self.blockchain_service.delegate_vote(delegator_address, delegatee_address, scheme_id)
+        
+        if not success:
+            # If blockchain fails, continue with database only but log the error
+            print(f"Blockchain delegation failed: {error}")
+
+        # Transfer all delegator's current vote to delegatee's current vote
+        delegator_current_votes = Usercurrentvote.query.filter_by(user_id=delegator_id, scheme_id=scheme.id).all()
+        for vote in delegator_current_votes:
+            delegatee_current_vote = Usercurrentvote(user_id=delegatee_id, scheme_id=scheme.id, vote=vote.vote)
+            db.session.add(delegatee_current_vote)
+            db.session.delete(vote)
+        db.session.commit()
+
+        delegator.delegate_to(delegatee, scheme_id)
+        return {'message': 'Delegation added successfully'}, 201
+class BlockchainStatusApi(Resource):
+    def __init__(self):
+        self.blockchain_service = BlockchainService()
+    
+    @auth_required('token')
+    def get(self):
+        try:
+            # Check if connected to blockchain
+            connected = w3.is_connected()
+            
+            # Get blockchain network info
+            network_id = w3.net.version
+            latest_block = w3.eth.block_number
+            gas_price = w3.eth.gas_price
+
+            CONTRACT_ADDRESS = os.getenv('CONTRACT_ADDRESS', 'YOUR_CONTRACT_ADDRESS')
+            
+            return {
+                'connected': connected,
+                'network_id': network_id,
+                'latest_block': latest_block,
+                'gas_price': str(gas_price),
+                'contract_address': CONTRACT_ADDRESS
+            }
+        except Exception as e:
+            return {
+                'connected': False,
+                'error': str(e)
+            }
+
+# Add the new API resource
+api.add_resource(BlockchainStatusApi, '/blockchain-status')
+api.add_resource(SchemeApi, '/scheme', '/scheme/<int:id>')
+api.add_resource(VoteApi, '/vote')
+api.add_resource(DelegationApi, '/delegation', '/delegation/<int:user_id>')
+
+
+
+// File: app.py
+from flask import Flask, render_template ,request,redirect, url_for, jsonify
+from model import *
+import os
+from api import *
+from flask_cors import CORS
+from config import DevelopmentConfig
+from flask_security import Security, SQLAlchemyUserDatastore, UserMixin, RoleMixin, login_required
+from flask_security import auth_required, roles_required, current_user
+from werkzeug.security import check_password_hash, generate_password_hash
+from flask_restful import marshal, fields
+from sec import datastore
+from PIL import Image
+from sqlalchemy.orm.exc import NoResultFound
+
+
+#==============================configuration===============================
+app = Flask(__name__)
+app.config.from_object(DevelopmentConfig)
+api.init_app(app)
+db.init_app(app)
+app.security = Security(app, datastore)
+app.app_context().push()
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.post('/user-login')
+def user_login():
+    data = request.get_json()
+    email = data.get('email')
+    if not email:
+        return jsonify({"message": "email not provided"}), 400
+
+    user = datastore.find_user(email=email)
+
+    if not user:
+        return jsonify({"message": "User Not Found"}), 404
+    
+    if not user.active:
+        return jsonify({"message": "User Not Activated"}), 400
+    
+
+    if check_password_hash(user.password, data.get("password")):
+        return jsonify({"token": user.get_auth_token(), "email": user.email, "role": user.roles[0].name, "username": user.username, "id": user.id})
+    else:
+        return jsonify({"message": "Wrong Password"}), 400
+    
+@app.post('/user-registration')
+def user_registration():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+    username = data.get('username')
+    if not email:
+        return jsonify({"message": "email not provided"}), 400
+    if not password:
+        return jsonify({"message": "password not provided"}), 400
+    if not username:
+        return jsonify({"message": "username not provided"}), 400
+    if datastore.find_user(email=email):
+        return jsonify({"message": "User Already Exists"}), 400
+    else:
+        datastore.create_user(
+            username=username,
+            email=email,
+            password=generate_password_hash(password),
+            roles=["Voter"])
+        db.session.commit()
+
+        uid = User.query.filter_by(email=email).first().id
+        schemes = Scheme.query.all()
+        for scheme in schemes:
+            usercurrentvote = Usercurrentvote(user_id=uid, scheme_id=scheme.id, vote=None)
+            db.session.add(usercurrentvote)
+        db.session.commit()
+        return jsonify({"message": "Voter Created"}), 201
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+// File: blockchain_config.py
+# blockchain_config.py
+import os
+import json
+from web3 import Web3
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Load environment variables
+INFURA_URL = 'http://localhost:8545'  # Updated to use local Ganache
+PRIVATE_KEY = os.getenv('PRIVATE_KEY', '0x40ebed728dfb45ebef989f0b65e378be0a97e1df8c9699046ec146a94eeeae9a')
+CONTRACT_ADDRESS =  '0x4b61a9D83B89c6C92e89fB6b8BF4Ec7fF8d01143'
+
+# Initialize Web3
+w3 = Web3(Web3.HTTPProvider(INFURA_URL))
+
+# Load contract ABI
+try:
+    with open('contract_abi.json', 'r') as f:
+        contract_abi = json.load(f)
+except FileNotFoundError:
+    print("Warning: contract_abi.json not found. Deploy the contract first.")
+    contract_abi = []
+
+# Add mock objects for testing if contract address is not set
+import unittest.mock as mock
+
+# If contract address is not set or invalid
+
+
+    # Initialize contract
+contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=contract_abi)
+    
+    # Account setup
+
+# Get the first account from Ganache
+from eth_account import Account
+
+# In blockchain_config.py
+PRIVATE_KEY = '0x40ebed728dfb45ebef989f0b65e378be0a97e1df8c9699046ec146a94eeeae9a'
+account = Account.from_key(PRIVATE_KEY)
+
+
+   
+// File: blockchain_service.py
+# blockchain_service.py
+from blockchain_config import w3, contract, account
+from web3.exceptions import ContractLogicError
+PRIVATE_KEY = '0x40ebed728dfb45ebef989f0b65e378be0a97e1df8c9699046ec146a94eeeae9a'
+class BlockchainService:
+    @staticmethod
+    def create_scheme(name, description):
+        try:
+            # Build transaction
+            tx = contract.functions.createScheme(name, description).build_transaction({
+                'from': account.address,
+                'nonce': w3.eth.get_transaction_count(account.address),
+                'gas': 2000000,
+                'gasPrice': w3.eth.gas_price
+            })
+            
+            # Sign transaction
+            signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+            
+            # Send transaction
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            
+            # Wait for transaction receipt
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            # Get the scheme ID from the event logs
+            scheme_created_event = contract.events.SchemeCreated().process_receipt(receipt)
+            scheme_id = scheme_created_event[0]['args']['id']
+            
+            return scheme_id, True, None
+        except ContractLogicError as e:
+            return None, False, str(e)
+        except Exception as e:
+            return None, False, str(e)
+    
+    @staticmethod
+    def cast_vote(user_address, scheme_id, vote_value):
+        try:
+            # Convert scheme_id to integer
+            scheme_id = int(scheme_id)
+            
+            # Build transaction
+            tx = contract.functions.castVote(scheme_id, vote_value).build_transaction({
+                'from': account.address,
+                'nonce': w3.eth.get_transaction_count(account.address),
+                'gas': 2000000,
+                'gasPrice': w3.eth.gas_price
+            })
+            
+            # Sign transaction
+            signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+            
+            # Send transaction
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            
+            # Wait for transaction receipt
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            return True, None
+        except ContractLogicError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, str(e)
+    
+    @staticmethod
+    def delegate_vote(delegator_address, delegatee_address, scheme_id):
+        try:
+            # Build transaction
+            tx = contract.functions.delegate(delegatee_address, scheme_id).build_transaction({
+                'from': account.address,
+                'nonce': w3.eth.get_transaction_count(account.address),
+                'gas': 2000000,
+                'gasPrice': w3.eth.gas_price
+            })
+            
+            # Sign transaction
+            signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+            
+            # Send transaction
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            
+            # Wait for transaction receipt
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            return True, None
+        except ContractLogicError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, str(e)
+    
+    @staticmethod
+    def get_vote_count(scheme_id):
+        try:
+            result = contract.functions.getVoteCount(scheme_id).call()
+            return result[0], result[1], True, None
+        except Exception as e:
+            return 0, 0, False, str(e)
+    
+    @staticmethod
+    def get_voter_weight(voter_address, scheme_id):
+        try:
+            # For string addresses, we can pass them directly to the contract function
+            weight = contract.functions.getVoterWeight(voter_address, scheme_id).call()
+            return weight, True, None
+        except Exception as e:
+            return 0, False, str(e)
+
+// File: config.py
+class Config(object):
+    DEBUG = False
+    TESTING = False
+
+
+class DevelopmentConfig(Config):
+    DEBUG = True
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///database.sqlite3'
+    SECRET_KEY = "thisissecter1"
+    SECURITY_PASSWORD_SALT = "thisissaltt1"
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    WTF_CSRF_ENABLED = False
+    SECURITY_TOKEN_AUTHENTICATION_HEADER = 'Authentication-Token'
+    CACHE_TYPE = "RedisCache"
+    CACHE_REDIS_HOST = "localhost"
+    CACHE_REDIS_PORT = 6379
+    CACHE_REDIS_DB = 3
+
+
+// File: deploy_contract.py
+# deploy_contract.py
+import json
+import os
+from web3 import Web3
+from solcx import compile_standard, install_solc
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Install specific Solidity compiler version
+install_solc('0.8.0')
+
+def deploy_contract():
+    # Connect to local Ganache blockchain
+    w3 = Web3(Web3.HTTPProvider('http://localhost:8545'))
+    
+    # Verify connection
+    if not w3.is_connected():
+        print("Failed to connect to Ganache. Make sure it's running.")
+        return
+    
+    print(f"Connected to local blockchain. Chain ID: {w3.eth.chain_id}")
+    
+    # Compile the contract
+    with open("contracts/VotingContract.sol", "r") as file:
+        contract_source_code = file.read()
+    
+    compiled_sol = compile_standard(
+        {
+            "language": "Solidity",
+            "sources": {"VotingContract.sol": {"content": contract_source_code}},
+            "settings": {
+                "outputSelection": {
+                    "*": {"*": ["abi", "metadata", "evm.bytecode", "evm.sourceMap"]}
+                }
+            },
+        },
+        solc_version="0.8.0",
+    )
+    
+    # Save the compiled contract
+    with open("compiled_contract.json", "w") as file:
+        json.dump(compiled_sol, file)
+    
+    # Get bytecode and ABI
+    bytecode = compiled_sol["contracts"]["VotingContract.sol"]["VotingContract"]["evm"]["bytecode"]["object"]
+    abi = compiled_sol["contracts"]["VotingContract.sol"]["VotingContract"]["abi"]
+    
+    # Save ABI to a file
+    with open("contract_abi.json", "w") as file:
+        json.dump(abi, file)
+    
+    # Create contract instance
+    VotingContract = w3.eth.contract(abi=abi, bytecode=bytecode)
+    
+    # Get the first account from Ganache
+    account = w3.eth.accounts[0]
+    
+    # Get transaction count
+    nonce = w3.eth.get_transaction_count(account)
+    
+    # Get gas price (use a reasonable value for local development)
+    gas_price = w3.eth.gas_price
+    
+    print(f"Deploying contract from account: {account}")
+    
+    # Build deployment transaction
+    transaction = VotingContract.constructor().build_transaction(
+        {
+            "chainId": w3.eth.chain_id,
+            "gas": 3000000,  # Higher gas limit for local testing
+            "gasPrice": gas_price,
+            "nonce": nonce,
+            "from": account
+        }
+    )
+    
+    # For local Ganache, we can use the unlocked account directly
+    tx_hash = w3.eth.send_transaction(transaction)
+    print(f"Deployment transaction sent: {tx_hash.hex()}")
+    
+    # Wait for transaction receipt
+    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    print(f"Contract deployed at address: {tx_receipt.contractAddress}")
+    
+    # Save contract address to .env file
+    with open(".env", "a") as env_file:
+        env_file.write(f"\nCONTRACT_ADDRESS={tx_receipt.contractAddress}")
+    
+    # Update blockchain_config.py with the new contract address
+    with open("blockchain_config.py", "r") as config_file:
+        config_content = config_file.read()
+    
+    # Replace the CONTRACT_ADDRESS line
+    updated_content = config_content.replace(
+        "CONTRACT_ADDRESS = os.getenv('CONTRACT_ADDRESS', 'YOUR_CONTRACT_ADDRESS')",
+        f"CONTRACT_ADDRESS = os.getenv('CONTRACT_ADDRESS', '{tx_receipt.contractAddress}')"
+    )
+    
+    # Replace the INFURA_URL line
+    updated_content = updated_content.replace(
+        "INFURA_URL = 'https://sepolia.infura.io/v3/b2d54daac63446b2b4f4ea5f18babef1'",
+        "INFURA_URL = 'http://localhost:8545'"
+    )
+    
+    with open("blockchain_config.py", "w") as config_file:
+        config_file.write(updated_content)
+    
+    print("blockchain_config.py updated with local settings and new contract address")
+    
+    return tx_receipt.contractAddress
+
+if __name__ == "__main__":
+    deploy_contract()
+
+// File: hardhat.config.js
+module.exports = {
+    solidity: "0.8.0",
+    networks: {
+      hardhat: {},
+      localhost: {
+        url: "http://localhost:8545",
+        chainId: 1337
+      }
+    }
+  };
+  
+// File: model.py
+from flask_sqlalchemy import SQLAlchemy
+from flask_security import UserMixin, RoleMixin
+from sqlalchemy.orm import aliased
+db = SQLAlchemy()
+
+
+class RolesUsers(db.Model):
+    __tablename__ = 'roles_users'
+    id = db.Column(db.Integer(), primary_key=True)
+    user_id = db.Column('user_id', db.Integer(), db.ForeignKey('user.id'))
+    role_id = db.Column('role_id', db.Integer(), db.ForeignKey('role.id'))
+
+
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String, unique=False)
+    email = db.Column(db.String, unique=True)
+    password = db.Column(db.String(255))
+    active = db.Column(db.Boolean())
+    fs_uniquifier = db.Column(db.String(255), unique=True, nullable=False)
+    roles = db.relationship('Role', secondary='roles_users', backref=db.backref('users', lazy='dynamic'))
+    currentvote = db.relationship('Usercurrentvote', backref='user', lazy='dynamic')
+
+    # Delegation relationship
+    delegates = db.relationship('Delegation',
+                                foreign_keys='Delegation.delegator_id',
+                                backref='delegator',
+                                lazy='dynamic')
+
+    def delegate_to(self, user, scheme_id):
+        if not self.is_delegating_to(user, scheme_id):
+            delegation = Delegation(delegator_id=self.id, delegatee_id=user.id, scheme_id=scheme_id)
+            db.session.add(delegation)
+            db.session.commit()
+
+    def is_delegating_to(self, user, scheme_id):
+        return self.delegates.filter_by(delegatee_id=user.id, scheme_id=scheme_id).count() > 0
+
+    def undelegate_to(self, user, scheme_id):
+        delegation = self.delegates.filter_by(delegatee_id=user.id, scheme_id=scheme_id).first()
+        if delegation:
+            db.session.delete(delegation)
+            db.session.commit()
+    
+    def calculate_weight(self, scheme_id, visited=None):
+        if visited is None:
+            visited = set()
+
+        if self.id in visited:
+            return 0  # We've encountered a circular delegation, so we stop here
+
+        visited.add(self.id)
+        weight = 1
+
+        # Use a subquery to avoid recursive queries
+        subq = db.session.query(Delegation.delegator_id).filter(
+            Delegation.scheme_id == scheme_id,
+            Delegation.delegatee_id == self.id
+        ).subquery()
+
+        delegator_alias = aliased(User)
+        delegators = db.session.query(delegator_alias).join(
+            subq, subq.c.delegator_id == delegator_alias.id
+        ).all()
+
+        for delegator in delegators:
+            weight += delegator.calculate_weight(scheme_id, visited.copy())
+
+        return weight
+class Role(db.Model, RoleMixin):
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String, nullable=False, unique=True)
+    description = db.Column(db.String, nullable=False)
+
+
+class Scheme(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), unique=True)
+    description = db.Column(db.String(255))
+    votes = db.relationship('Vote', backref='scheme', lazy='dynamic')
+
+class Vote(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    scheme_id = db.Column(db.Integer, db.ForeignKey('scheme.id'))
+    vote = db.Column(db.String(255), nullable=False)  # Changed to store base64 encoded ciphertext
+    encryption_key = db.relationship('EncryptionKey', backref='vote', uselist=False)
+
+
+class Usercurrentvote(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    scheme_id = db.Column(db.Integer, db.ForeignKey('scheme.id'))
+    vote = db.Column(db.Boolean)
+
+class Delegation(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    delegator_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    delegatee_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    scheme_id = db.Column(db.Integer, db.ForeignKey('scheme.id'), nullable=False)
+
+class EncryptionKey(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    vote_id = db.Column(db.Integer, db.ForeignKey('vote.id'))
+    encrypted_key = db.Column(db.LargeBinary, nullable=False)
+    nonce = db.Column(db.LargeBinary, nullable=False)
+    tag = db.Column(db.LargeBinary, nullable=False)
+
+
+// File: sec.py
+from flask_security import Security, SQLAlchemyUserDatastore, UserMixin, RoleMixin, login_required
+from model import db, User, Role
+datastore = SQLAlchemyUserDatastore(db, User, Role)
+// File: upload_initial_data.py
+from app import app
+from sec import datastore
+from model import db
+from flask_security import hash_password
+from werkzeug.security import generate_password_hash
+
+
+with app.app_context():
+    db.create_all()
+    datastore.find_or_create_role(name="Admin", description="user is Admin")
+    datastore.find_or_create_role(name="Voter", description="user is Voter")
+    db.session.commit()
+    if not datastore.find_user(email="admin@gmail.com"):
+        datastore.create_user(
+            username="admin",
+            email="admin@gmail.com",
+            password= generate_password_hash("admin"),
+            roles=["Admin"])
+    if not datastore.find_user(email="voter1@gmail.com"):
+        datastore.create_user(
+            username="voter1",
+            email="voter1@gmail.com",
+            password=generate_password_hash("voter1"),
+            roles=["Voter"])
+    if not datastore.find_user(email="sai@gmail.com"):
+        datastore.create_user(
+            username="sai",
+            email="sai@gmail.com",
+            password=generate_password_hash("sai"),
+            roles=["Voter"])
+    db.session.commit()
+
+
+
+// File: wallet.py
+from web3 import Web3
+import os
+import json
+from eth_account import Account
+import secrets
+from model import db, User
+
+class WalletManager:
+    def __init__(self, app=None):
+        self.app = app
+        if app is not None:
+            self.init_app(app)
+    
+    def init_app(self, app):
+        self.app = app
+        # Ensure the wallets directory exists
+        os.makedirs('wallets', exist_ok=True)
+    
+    def create_wallet(self, user_id, password):
+        """Create a new Ethereum wallet for a user."""
+        # Generate a random private key
+        private_key = "0x" + secrets.token_hex(32)
+        
+        # Create account from private key
+        account = Account.from_key(private_key)
+        
+        # Encrypt private key with password
+        encrypted_key = Account.encrypt(private_key, password)
+        
+        # Save encrypted key to file
+        wallet_path = f'wallets/wallet_{user_id}.json'
+        with open(wallet_path, 'w') as f:
+            json.dump(encrypted_key, f)
+        
+        # Return address and private key
+        return {
+            'address': account.address,
+            'private_key': private_key
+        }
+    
+    def get_wallet(self, user_id, password):
+        """Get a user's wallet by decrypting their keystore file."""
+        wallet_path = f'wallets/wallet_{user_id}.json'
+        
+        # Check if wallet exists
+        if not os.path.exists(wallet_path):
+            return None
+        
+        # Load encrypted key
+        with open(wallet_path, 'r') as f:
+            encrypted_key = json.load(f)
+        
+        try:
+            # Decrypt private key
+            private_key = Account.decrypt(encrypted_key, password)
+            account = Account.from_key(private_key)
+            
+            return {
+                'address': account.address,
+                'private_key': private_key.hex()
+            }
+        except ValueError:
+            # Incorrect password
+            return None
+    
+    def wallet_exists(self, user_id):
+        """Check if a wallet exists for a user."""
+        wallet_path = f'wallets/wallet_{user_id}.json'
+        return os.path.exists(wallet_path)
+
+# Create wallet manager instance
+wallet_manager = WalletManager()
+
+// File: contracts/VotingContract.sol
+// contracts/VotingContract.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract VotingContract {
+    struct Scheme {
+        uint256 id;
+        string name;
+        string description;
+        bool active;
+    }
+    
+    struct Vote {
+        address voter;
+        uint256 schemeId;
+        bool vote;
+        bool exists;
+    }
+    
+    struct Delegation {
+        address delegator;
+        address delegatee;
+        uint256 schemeId;
+    }
+    
+    mapping(uint256 => Scheme) public schemes;
+    mapping(address => mapping(uint256 => Vote)) public votes;
+    mapping(address => mapping(uint256 => address)) public delegations;
+    mapping(uint256 => address[]) public schemeVoters;
+    
+    uint256 public schemeCount = 0;
+    address public admin;
+    
+    event SchemeCreated(uint256 id, string name, string description);
+    event VoteCast(address indexed voter, uint256 indexed schemeId, bool vote);
+    event DelegationSet(address indexed delegator, address indexed delegatee, uint256 indexed schemeId);
+    
+    constructor() {
+        admin = msg.sender;
+    }
+    
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin can call this function");
+        _;
+    }
+    
+    function createScheme(string memory _name, string memory _description) public onlyAdmin returns (uint256) {
+        schemeCount++;
+        schemes[schemeCount] = Scheme(schemeCount, _name, _description, true);
+        emit SchemeCreated(schemeCount, _name, _description);
+        return schemeCount;
+    }
+    
+    function castVote(uint256 _schemeId, bool _vote) public {
+        require(schemes[_schemeId].active, "Scheme is not active");
+        require(!votes[msg.sender][_schemeId].exists, "You have already voted");
+        
+        // If the voter has delegated their vote, they cannot vote
+        require(delegations[msg.sender][_schemeId] == address(0), "You have delegated your vote");
+        
+        votes[msg.sender][_schemeId] = Vote(msg.sender, _schemeId, _vote, true);
+        schemeVoters[_schemeId].push(msg.sender);
+        
+        emit VoteCast(msg.sender, _schemeId, _vote);
+    }
+    
+    function delegate(address _delegatee, uint256 _schemeId) public {
+        require(schemes[_schemeId].active, "Scheme is not active");
+        require(!votes[msg.sender][_schemeId].exists, "You have already voted");
+        require(_delegatee != msg.sender, "Cannot delegate to yourself");
+        
+        // Check for circular delegation
+        address currentDelegatee = _delegatee;
+        while (currentDelegatee != address(0)) {
+            require(currentDelegatee != msg.sender, "Circular delegation not allowed");
+            currentDelegatee = delegations[currentDelegatee][_schemeId];
+        }
+        
+        delegations[msg.sender][_schemeId] = _delegatee;
+        emit DelegationSet(msg.sender, _delegatee, _schemeId);
+    }
+    
+    function getVoteCount(uint256 _schemeId) public view returns (uint256 trueVotes, uint256 falseVotes) {
+        for (uint i = 0; i < schemeVoters[_schemeId].length; i++) {
+            address voter = schemeVoters[_schemeId][i];
+            if (votes[voter][_schemeId].vote) {
+                trueVotes++;
+            } else {
+                falseVotes++;
+            }
+        }
+    }
+    
+    function getVoterWeight(address _voter, uint256 _schemeId) public view returns (uint256) {
+        uint256 weight = 1;
+        for (uint i = 0; i < schemeVoters[_schemeId].length; i++) {
+            address potentialDelegator = schemeVoters[_schemeId][i];
+            if (delegations[potentialDelegator][_schemeId] == _voter) {
+                weight++;
+            }
+        }
+        return weight;
+    }
+}
+
+// File: static/style.css
+@import url("https://fonts.googleapis.com/css2?family=Bree+Serif&family=Caveat:wght@400;700&family=Lobster&family=Monoton&family=Open+Sans:ital,wght@0,400;0,700;1,400;1,700&family=Playfair+Display+SC:ital,wght@0,400;0,700;1,700&family=Playfair+Display:ital,wght@0,400;0,700;1,700&family=Roboto:ital,wght@0,400;0,700;1,400;1,700&family=Source+Sans+Pro:ital,wght@0,400;0,700;1,700&family=Work+Sans:ital,wght@0,400;0,700;1,700&display=swap");
+@import url("https://fonts.cdnfonts.com/css/mystical");
+* {
+  margin: 0px;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen",
+    "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #e3e6e4;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, "Courier New",
+    monospace;
+}
+
+.navbarbg {
+  height: 55px;
+  background-color: white;
+}
+
+input.searche {
+  height: 36px;
+  max-width: 500px;
+  background-color: #eef3f8;
+  border: 0;
+}
+
+input.searche::placeholder {
+  font-size: 14px;
+  color: gray;
+  background-repeat: no-repeat;
+  background-size: 7%;
+  background-position: 0% 50%;
+  padding: 10%;
+}
+
+.body {
+  background-color: #f3f2ef;
+  margin: 0px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen",
+    "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.menutext {
+  font-size: 13px;
+  font-family: Arial, Helvetica, sans-serif;
+  color: gray;
+  margin-top: 5px;
+  font-weight: lighter;
+  text-decoration: none;
+}
+
+.menutext:hover {
+  color: black;
+}
+
+button.mediatext {
+  color: #5f5f5f;
+}
+
+button.mediatext:hover {
+  color: #5f5f5f;
+}
+
+.mediatext {
+  font-size: 15px;
+  font-weight: bold;
+  font-family: Arial, Helvetica, sans-serif;
+  color: #5f5f5f;
+}
+
+i {
+  color: gray;
+  margin-top: 8px;
+}
+
+i:hover {
+  color: black;
+}
+
+input.content {
+  border-radius: 40px;
+  height: 45px;
+}
+
+input.content::placeholder {
+  font-weight: bolder;
+  font-size: 14px;
+  font-family: Arial, Helvetica, sans-serif;
+  background-repeat: no-repeat;
+  background-size: auto;
+  padding-left: 5%;
+}
+
+div.card {
+  border-radius: 10px;
+}
+
+.header {
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 16px;
+  font-weight: bolder;
+}
+
+.view {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  font-size: 12px;
+  font-weight: bold;
+  color: #5f5f5f;
+}
+
+.categories {
+  font-size: 13px;
+  font-weight: bold;
+  color: #0a66c2;
+}
+
+li {
+  font-size: 14px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  font-weight: bold;
+}
+
+.link {
+  font-size: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  color: #5f5f5f;
+}
+
+.ref:hover i,
+.ref:hover i span,
+svg:hover span {
+  color: white;
+}
+
+.ref i {
+  display: flex;
+  align-items: center;
+  margin: 0;
+}
+
+.postphoto {
+  border-radius: 50%;
+  width: 50px;
+  height: 50px;
+}
+.posttext {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  font-weight: bold;
+  font-size: 14px;
+}
+
+.profile-desc {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  color: #474747;
+}
+
+.card-desc {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  color: black;
+}
+
+.right-panel-pic {
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+}
+
+.right-panel-desc {
+  font-weight: lighter;
+  font-size: 13px;
+  color: #5f5f5f;
+}
+
+/*login.js*/
+.main-container {
+  background-color: #e3e6e4;
+  min-height: 100vh;
+  padding-top: 20px;
+}
+
+.form-container {
+  color: #fff;
+  background-color: rgba(0, 0, 0, 0.4);
+  padding: 40px;
+  border-radius: 5px;
+  box-shadow: 0 0 10px #000;
+  width: 500px;
+  height: 430px;
+}
+
+.login-input {
+  width: 140px;
+}
+
+.input-field {
+  background-color: rgba(0, 0, 0, 0.7);
+}
+
+.button-86 {
+  all: unset;
+  width: 100px;
+  height: 30px;
+  font-size: 16px;
+  background: transparent;
+  border: none;
+  position: relative;
+  color: #f0f0f0;
+  cursor: pointer;
+  z-index: 1;
+  padding: 10px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+}
+
+.button-86::after,
+.button-86::before {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  z-index: -99999;
+  transition: all 0.4s;
+}
+
+.button-86::before {
+  transform: translate(0%, 0%);
+  width: 100%;
+  height: 100%;
+  background: #28282d;
+  border-radius: 10px;
+}
+
+.button-86::after {
+  transform: translate(10px, 10px);
+  width: 35px;
+  height: 35px;
+  background: #ffffff15;
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  border-radius: 50px;
+}
+
+.button-86:hover::before {
+  transform: translate(5%, 20%);
+  width: 110%;
+  height: 110%;
+}
+
+.button-86:hover::after {
+  border-radius: 10px;
+  transform: translate(0, 0);
+  width: 100%;
+  height: 100%;
+}
+
+.button-86:active::after {
+  transition: 0s;
+  transform: translate(0, 5%);
+}
+
+.center {
+  position: relative;
+  padding: 50px 50px;
+  background: #fff;
+  border-radius: 10px;
+}
+.center h1 {
+  font-size: 2em;
+  border-left: 5px solid dodgerblue;
+  padding: 10px;
+  color: #000;
+  letter-spacing: 5px;
+  margin-bottom: 60px;
+  font-weight: bold;
+  padding-left: 10px;
+}
+.center .inputbox {
+  position: relative;
+  width: 300px;
+  height: 50px;
+  margin-bottom: 50px;
+}
+.center .inputbox input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  border: 2px solid #000;
+  outline: none;
+  background: none;
+  padding: 10px;
+  border-radius: 10px;
+  font-size: 1.2em;
+}
+.center .inputbox:last-child {
+  margin-bottom: 0;
+}
+.center .inputbox span {
+  position: absolute;
+  top: 14px;
+  left: 20px;
+  font-size: 1em;
+  transition: 0.6s;
+  font-family: sans-serif;
+}
+.center .inputbox input:focus ~ span,
+.center .inputbox input:valid ~ span {
+  transform: translateX(-13px) translateY(-35px);
+  font-size: 1em;
+}
+.center .inputbox [type="button"] {
+  width: 50%;
+  background: dodgerblue;
+  color: #fff;
+  border: #fff;
+}
+.center .inputbox:hover [type="button"] {
+  background: linear-gradient(45deg, greenyellow, dodgerblue);
+}
+
+/*navbar.js*/
+.navbar-container {
+  background-color: #f8f9fa;
+  box-shadow: 0px 4px 6px rgba(0, 0, 0, 0.4);
+}
+
+.pulser {
+  width: 20px;
+  height: 20px;
+  background: red;
+  border-radius: 50%;
+  position: relative;
+  margin-left: 10px;
+}
+
+.pulser::after {
+  animation: pulse 1000ms cubic-bezier(0.9, 0.7, 0.5, 0.9) infinite;
+}
+
+@keyframes pulse {
+  0% {
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.4);
+    opacity: 0.4;
+  }
+}
+
+.pulser::after {
+  content: "";
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  top: 0;
+  left: 0;
+  background: darkred;
+  border-radius: 50%;
+  z-index: -1;
+}
+
+.app-logo-img {
+  height: 40px;
+  width: 40px;
+}
+
+.app-logout-img {
+  height: 30px;
+  width: 30px;
+  border-radius: 15px;
+}
+
+.navbar {
+  background-color: #fff;
+  border-bottom-left-radius: 20px;
+  border-bottom-right-radius: 20px;
+}
+
+.nav-item {
+  margin-right: 50px;
+}
+
+.navbar-head {
+  font-size: 25px;
+  font-family: Georgia, serif;
+  padding: 5px;
+}
+
+/*faculty_home.js*/
+.fac-home-container {
+  background-color: lightcyan;
+  background-size: cover;
+  min-height: 100vh;
+}
+
+.greeting {
+  font-family: Helvetica;
+  font-weight: bold;
+}
+
+.add-course-btn {
+  background-color: lightcyan;
+  height: 40px;
+  width: 140px;
+  border-radius: 5px;
+  border-color: transparent;
+  box-shadow: 10px 10px 20px 0px rgba(0, 0, 0, 0.1);
+  transition: 0.3s ease;
+  font-weight: bolder;
+  color: black;
+}
+
+.add-course-btn:hover {
+  background-color: cyan;
+}
+
+.scope {
+  font-family: Helvetica;
+  font-size: larger;
+}
+
+.list-container {
+  background-color: #fff;
+  border-radius: 10px;
+}
+
+.list-group {
+  list-style: none;
+}
+
+.elist-group-item {
+  background-color: #eef3f8;
+  border-radius: 10px;
+}
+
+.rlist-group-item {
+  background-color: #eef3f8;
+  border-radius: 10px;
+  border: red solid;
+  border-width: 1px;
+}
+
+/*student_home.js*/
+.schedule-time {
+  font-family: "Roboto";
+}
+
+.schedule-heading {
+  color: #000;
+}
+
+.list-group-item {
+  border-radius: 10px;
+}
+
+.modal-mask {
+  position: fixed;
+  z-index: 9998;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, .5);
+  display: table;
+  transition: opacity .3s ease;
+}
+
+.modal-wrapper {
+  display: table-cell;
+  vertical-align: middle;
+}
+
+.modal-container {
+  width: 300px;
+  margin: 0px auto;
+  padding: 20px 30px;
+  background-color: #fff;
+  border-radius: 2px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .33);
+  transition: all .3s ease;
+}
+
+.modal-header h3 {
+  margin-top: 0;
+  color: #42b983;
+}
+
+.modal-body {
+  margin: 20px 0;
+}
+
+.modal-enter-active, .modal-leave-active {
+  transition: opacity .5s;
+}
+
+.modal-enter, .modal-leave-to {
+  opacity: 0;
+}
+
+.loader {
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #3498db;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+  margin: 20px auto;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+// File: static/vue/components/about.js
+const About = Vue.component("about", {
+    template:  `<div class="container mt-5">
+                    <div class="alert alert-info" role="alert">
+                        <h4 class="alert-heading">Page is coming soon, stay tuned!</h4>
+                        <p>We're working on something awesome. Please check back later.</p>
+                    </div>
+                </div>`,
+});
+
+export default About;
+
+// File: static/vue/components/adminhome.js
+const Adminhome = Vue.component("adminhome", {
+    template: `
+    <div class="main-container pb-5">
+        <div class="container">
+            <div class="row">
+                <div class="col-lg-8 offset-lg-2">
+                    <!-- Welcome Message -->
+                    <div class="jumbotron pt-3 pb-3">
+                        <h1 class="display-4 greeting">Welcome, {{username}}!</h1>
+                        <p class="scope">You can Create, Edit, Delete Schemes</p>
+                        <button class="add-course-btn" data-bs-toggle="modal" data-bs-target="#addSchemeModal">Add Scheme
+                            <i class="fa fa-plus" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <div class="alert alert-danger" v-if="error">
+                        {{ error }}
+                    </div>
+                    <div class="mt-4">
+                        <div v-if="loading" class="loader"></div>
+                        <div v-else-if="schemes.length == 0">
+                            <p class="text-center">No schemes available</p>
+                        </div>
+                        <div v-else>
+                            <h2>Schemes</h2>
+                            <ul class="list-group">
+                                <li class="list-group-item" v-for="scheme in schemes" :key="scheme.id">
+                                    <h5>{{ scheme.name }}</h5>
+                                    <p muted>{{ scheme.description }}</p>
+                                    <div class="btn-group" role="group">
+                                        <button type="button" class="btn btn-sm btn-outline-secondary" :data-bs-target="'#editSchemeModal' + scheme.id" data-bs-toggle="modal">Edit</button>
+                                        <button type="button" class="btn btn-sm btn-outline-danger" @click="deleteScheme(scheme.id)">Delete</button>
+                                    </div>
+                                    <div class="progress mt-3">
+                                        <div class="progress-bar bg-success" role="progressbar" :style="'width:' + scheme.true_vote_percentage + '%'">
+                                            <span>{{ scheme.true_vote_percentage }}%</span>
+                                        </div>
+                                        <div class="progress-bar bg-danger" role="progressbar" :style="'width:' + scheme.false_vote_percentage + '%'">
+                                            <span>{{ scheme.false_vote_percentage }}%</span>
+                                        </div>
+                                    </div>
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+                </div> 
+            </div> 
+        </div> 
+
+        <div class="modal fade" id="addSchemeModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="addSchemeModalLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h1 class="modal-title fs-5" id="addSchemeModalLabel">Add Course</h1>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="my-3">
+                            <label for="roomname">Enter Scheme Name</label>
+                            <input v-model="scheme_name" type="text" id="scheme_name" class="form-control" placeholder="Scheme Name">
+                        </div>
+                        <div class="my-3">
+                            <label for="scheme_description">Enter Scheme Description</label>
+                            <textarea v-model="scheme_description" class="form-control"></textarea>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                        <button type="button" @click="addScheme" class="btn btn-primary" data-bs-dismiss="modal">Submit</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div v-for="scheme in schemes" :key="scheme.id" class="modal fade" :id="'editSchemeModal' + scheme.id" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="editSchemeModalLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h1 class="modal-title fs-5" id="editSchemeModalLabel">Edit Scheme</h1>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="my-3">
+                            <label for="roomname">Enter Scheme Name</label>
+                            <input v-model="scheme.name" type="text" id="scheme_name" class="form-control" placeholder="Scheme Name">
+                        </div>
+                        <div class="my-3">
+                            <label for="scheme_description">Enter Scheme Description</label>
+                            <textarea v-model="scheme.description" class="form-control"></textarea>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                        <button type="button" @click="editScheme(scheme)" class="btn btn-primary" data-bs-dismiss="modal">Submit</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    `,
+
+    data() {
+        return {
+            userRole: localStorage.getItem("role"),
+            token: localStorage.getItem("auth-token"),
+            username: localStorage.getItem("username"),
+            user_id: localStorage.getItem("id"),
+            error: null,
+            schemes: [],
+            scheme_name: null,
+            scheme_description: null,
+            loading: false,
+        }
+    },
+
+    methods: {
+        async getschemes() {
+            this.loading = true;
+            try {
+                const res = await fetch("/scheme/" + this.user_id, {
+                    method: "GET",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authentication-Token": this.token,
+                        "Authentication-Role": this.userRole,
+                    },
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    console.log(data);
+                    this.schemes = data;
+                } else {
+                    const data = await res.json();
+                    console.log(data);
+                    this.error = data.error_message;
+                }
+            } catch (error) {
+                this.error = "An error occurred while fetching schemes.";
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        async addScheme() {
+            this.loading = true;
+            try {
+                const res = await fetch("/scheme", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authentication-Token": this.token,
+                        "Authentication-Role": this.userRole,
+                    },
+                    body: JSON.stringify({
+                        name: this.scheme_name,
+                        description: this.scheme_description,
+                    }),
+                });
+                if (res.ok) {
+                    await this.getschemes();
+                    this.scheme_name = null;
+                    this.scheme_description = null;
+                } else {
+                    const data = await res.json();
+                    console.log(data);
+                    this.error = data.error_message;
+                }
+            } catch (error) {
+                this.error = "An error occurred while adding the scheme.";
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        async deleteScheme(id) {
+            this.loading = true;
+            try {
+                const res = await fetch("/scheme/" + id, {
+                    method: "DELETE",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authentication-Token": this.token,
+                        "Authentication-Role": this.userRole,
+                    },
+                });
+                if (res.ok) {
+                    await this.getschemes();
+                } else {
+                    const data = await res.json();
+                    console.log(data);
+                    this.error = data.error_message;
+                }
+            } catch (error) {
+                this.error = "An error occurred while deleting the scheme.";
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        async editScheme(scheme) {
+            this.loading = true;
+            try {
+                const res = await fetch("/scheme/" + scheme.id, {
+                    method: "PUT",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authentication-Token": this.token,
+                        "Authentication-Role": this.userRole,
+                    },
+                    body: JSON.stringify({
+                        name: scheme.name,
+                        description: scheme.description,
+                    }),
+                });
+                if (res.ok) {
+                    await this.getschemes();
+                } else {
+                    const data = await res.json();
+                    console.log(data);
+                    this.error = data.error_message;
+                }
+            } catch (error) {
+                this.error = "An error occurred while editing the scheme.";
+            } finally {
+                this.loading = false;
+            }
+        }
+    },
+
+    mounted: function() {
+        this.getschemes();
+        document.title = "Admin Home";
+    },
+});
+
+export default Adminhome;
+// File: static/vue/components/home.js
+import Adminhome from "./adminhome.js";
+import Voterhome from "./voterhome.js";
+
+
+const Home = Vue.component("home", {
+    template:  
+    `
+    <div>
+        <div v-if="role === 'Admin'">
+            <Adminhome></Adminhome>
+        </div>
+        <div v-if="role === 'Voter'">
+            <Voterhome></Voterhome>
+        </div>
+    </div>
+    `,
+
+    data() {
+        return {
+            role: localStorage.getItem('role'),
+        };
+    },
+    components: {
+        Adminhome,
+        Voterhome,
+    },
+
+    mounted() {
+        Document.title = "Home";
+    }
+});
+export default Home;
+
+// File: static/vue/components/login.js
+const Login = Vue.component("login", {
+  template: `
+  <div class="main-container d-flex flex-column justify-content-center">
+  <div class="container">
+    <div class="row justify-content-center">
+      <div class="form-container col-md-6 p-5">
+        <h2 class="text-center">Login</h2>
+        <div class="alert alert-danger" v-if="error">
+          {{ error }}
+        </div>
+          <div class="form-group p-1">
+            <label for="email">Email:</label>
+            <input class="input-field" type="text" class="form-control login-input" id="username" name="username" placeholder="Enter email"
+            v-model="cred.email">
+          </div>
+          <div class="form-group p-1">
+            <label for="password">Password:</label>
+            <input type="password" class="form-control mb-2" id="password" name="password" placeholder="Enter password"
+            v-model="cred.password">
+          </div>
+          <div class="d-flex flex-row">
+          <button class="button-86" type="submit" role="button" @click='login'>Login</button>
+          </div>
+          <p class="mt-3">Don't have an account? <router-link to="/register">Register as Voter here</router-link></p>
+      </div>
+    </div>
+  </div>
+  </div>`,
+  data() {
+    return {
+      cred: {
+        email: null,
+        password: null,
+      },
+      error: null,
+    };
+  },
+  methods: {
+    async login() {
+      const res = await fetch("/user-login", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(this.cred),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        console.log(data);
+        localStorage.setItem("auth-token", data.token);
+        localStorage.setItem("role", data.role);
+        localStorage.setItem("id", data.id);
+        localStorage.setItem("username", data.username);
+        this.$router.push("/");
+      } else {
+        const data = await res.json();
+        console.log(data);
+        this.error = data.message;
+      }
+    },
+  },
+  mounted: function () {
+    document.title = "Login";
+  },
+});
+
+export default Login;
+
+// File: static/vue/components/navbar.js
+const Navbar = Vue.component("Navbar", {
+    template: `
+  
+    <nav class="navbar navbar-expand-lg sticky-top border-bottom navbar-container">
+    <div class="container">
+      <a class="navbar-brand" href="/">
+        <span class="navbar-head">LIQUID DEMOCRACY</span>
+      </a>
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNavAltMarkup" aria-controls="navbarNavAltMarkup" aria-expanded="false" aria-label="Toggle navigation">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+      <div class="collapse navbar-collapse" id="navbarNavAltMarkup">
+        <ul class="navbar-nav ms-auto">
+          <li class="nav-item active mr-3">
+            <a class="nav-link" href="/#/" style="display: flex; flex-direction: column; align-items: center; text-align: center;">
+              <i class="fas fa-home fa-lg text-center" style="color: black"></i>
+              <router-link class="menutext mt-2" to="/">Home</router-link>
+            </a>
+          </li>
+          <li class="nav-item mr-3">
+            <a class="nav-link" href="/#/about" style="display: flex; flex-direction: column; align-items: center; text-align: center;">
+              <i class="fas fa-info-circle fa-lg text-center" style="color: black"></i>
+              <div class="menutext mt-2"><router-link class="menutext mt-2" to="/about">About Us</router-link></div>
+            </a>
+          </li>
+          <li class="nav-item logout-thor mr-3">
+            <a @click='logout' class="nav-link active d-lg-block" style="display: flex; flex-direction: column; align-items: center; text-align: center; border: none; background: none;">
+                <i class="fas fa-sign-out-alt fa-lg text-center" style="color: black"></i>
+              <div class="menutext">Logout</div>
+            </a>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </nav>
+  
+  
+    
+    
+    `,
+    data() {
+      return {
+        role: localStorage.getItem("role"),
+        is_login: localStorage.getItem("auth-token"),
+        id: localStorage.getItem("id"),
+        inactivityTimeout: 5 * 60 * 1000, // 30 minutes in milliseconds
+        inactivityTimer: null,
+      };
+    },
+    methods: {
+      logout() {
+        localStorage.removeItem("auth-token");
+        localStorage.removeItem("role");
+        localStorage.removeItem("id");
+        localStorage.removeItem("username");
+        this.$router.push({ path: "/login" });
+      },
+      handleUserActivity() {
+        // Update the last activity timestamp
+        localStorage.setItem("lastActivityTimestamp", Date.now().toString());
+      },
+      checkInactivity() {
+        const lastActivityTimestamp = localStorage.getItem(
+          "lastActivityTimestamp"
+        );
+        const currentTime = Date.now();
+  
+        if (
+          lastActivityTimestamp &&
+          currentTime - lastActivityTimestamp > this.inactivityTimeout
+        ) {
+          // User has been inactive for too long, clear local storage
+          this.clearLocalStorage();
+        }
+      },
+      clearLocalStorage() {
+        localStorage.removeItem("auth-token");
+        localStorage.removeItem("role");
+        this.$router.push({ path: "/login" });
+      },
+      startInactivityTimer() {
+        this.inactivityTimer = setInterval(() => {
+          this.checkInactivity();
+        }, 60000); // Check every minute (adjust as needed)
+      },
+      stopInactivityTimer() {
+        clearInterval(this.inactivityTimer);
+      },
+    },
+    mounted() {
+      // Set up event listeners to track user activity
+      document.addEventListener("mousemove", this.handleUserActivity);
+      document.addEventListener("keydown", this.handleUserActivity);
+      document.title = "Navbar";
+  
+      // Start the inactivity timer
+      this.startInactivityTimer();
+    },
+    beforeDestroy() {
+      // Clean up event listeners and the inactivity timer
+      document.removeEventListener("mousemove", this.handleUserActivity);
+      document.removeEventListener("keydown", this.handleUserActivity);
+      this.stopInactivityTimer();
+    },
+  });
+  
+  export default Navbar;
+  
+// File: static/vue/components/registration.js
+// Assuming you already have Vue imported and set up
+
+const Registration = Vue.component('registration', {
+    template: `<div class="container">
+      <div class="row justify-content-center">
+        <div class="col-md-6">
+          <h2 class="text-center">Registration Form</h2>
+          <div class="alert alert-danger" v-if="error">
+            {{ error }}
+          </div>
+          <div class="form-group">
+            <label for="username">Username:</label>
+            <input type="text" class="form-control" id="username" name="username" placeholder="Enter username"
+              v-model="user.username">
+          </div>
+          <div class="form-group">
+            <label for="email">Email:</label>
+            <input type="text" class="form-control" id="email" name="email" placeholder="Enter email"
+              v-model="user.email">
+          </div>
+          <div class="form-group">
+            <label for="password">Password:</label>
+            <input type="password" class="form-control" id="password" name="password" placeholder="Enter password"
+              v-model="user.password">
+          </div>
+          <div class="form-group">
+            <label for="confirmPassword">Confirm Password:</label>
+            <input type="password" class="form-control" id="confirmPassword" name="confirmPassword"
+              placeholder="Confirm password" v-model="user.confirmPassword">
+          </div>
+          <button type="submit" class="btn btn-primary" @click="register">Register</button>
+          <p class="mt-3">Already have an account? <router-link to="/login">Login here</router-link></p>
+        </div>
+      </div>
+    </div>`,
+    data() {
+      return {
+        user: {
+          username: null,
+          email: null,
+          password: null,
+          confirmPassword: null,
+        },
+        error: null,
+      };
+    },
+    methods: {
+      async register() {
+        if (this.user.password !== this.user.confirmPassword) {
+          this.error = "Passwords do not match.";
+          return;
+        }
+  
+        const res = await fetch('/user-registration', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            username: this.user.username,
+            email: this.user.email,
+            password: this.user.password,
+          }),
+        });
+  
+        if (res.ok) {
+          this.$router.push('/login');
+
+        } else {
+          const data = await res.json();
+          this.error = data.message;
+
+        }
+      },
+    },
+    mounted: function () {
+      document.title = 'Registration';
+    },
+  });
+  export default Registration;
+  
+// File: static/vue/components/voterhome.js
+const Voterhome = Vue.component("voterhome", {
+  template: `
+    <div class="main-container pb-5">
+      <div class="container">
+        <div class="row">
+          <div class="col-lg-8 offset-lg-2">
+            <div class="jumbotron pt-3 pb-3">
+              <h1 class="display-4 greeting">Welcome, {{ username }}!</h1>
+            </div>
+            <div class="alert alert-danger" v-if="error">
+              {{ error }}
+            </div>
+            <div class="mt-2">
+              <div v-if="loading" class="loader"></div>
+              <div v-else-if="schemes.length == 0">
+                <p class="text-center">No schemes available</p>
+              </div>
+              <div v-else>
+                <h2>Available Schemes</h2>
+                <ul class="list-group">
+                  <li class="list-group-item" v-for="scheme in schemes" :key="scheme.id">
+                    <h5>{{ scheme.name }}</h5>
+                    <p class="text-muted">{{ scheme.description }}</p>
+                    <p>Your voting weight: {{ scheme.userWeight }}</p>
+                    <p>Delegation chain length: {{ scheme.delegationChainLength }}</p>
+                    <p>Voting power distribution (Gini coefficient): {{ scheme.giniCoefficient.toFixed(4) }}</p>
+                    
+                    <div v-if="!scheme.delegated_to">
+                      <div v-if="scheme.allowed_to_vote">
+                        <div class="btn-group" role="group">
+                          <div class="form-check form-check-inline">
+                            <input
+                              class="form-check form-check-inline"
+                              type="radio"
+                              :name="'agree' + scheme.id"
+                              :id="'agree' + scheme.id"
+                              value="true"
+                              v-model="scheme.Vote"
+                            />
+                            <label
+                              class="form-check form-check-inline"
+                              :for="'agree' + scheme.id"
+                            >Agree</label>
+
+                            <input
+                              class="form-check form-check-inline"
+                              type="radio"
+                              :name="'disagree' + scheme.id"
+                              :id="'disagree' + scheme.id"
+                              value="false"
+                              v-model="scheme.Vote"
+                            />
+                            <label
+                              class="form-check form-check-inline"
+                              :for="'disagree' + scheme.id"
+                            >Disagree</label>
+
+                            <button
+                              type="button"
+                              class="btn btn-sm btn-outline-primary"
+                              @click="vote(scheme)"
+                            >
+                              Vote
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                      <div v-else>
+                        <div class="progress">
+                          <div
+                            class="progress-bar bg-success"
+                            role="progressbar"
+                            :style="'width:' + scheme.trueVotePercentage + '%'"
+                          >
+                            <span>{{ scheme.trueVotePercentage.toFixed(2) }}%</span>
+                          </div>
+                          <div
+                            class="progress-bar bg-danger"
+                            role="progressbar"
+                            :style="'width:' + scheme.falseVotePercentage + '%'"
+                          >
+                            <span>{{ scheme.falseVotePercentage.toFixed(2) }}%</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="mt-2" v-if="scheme.allowed_to_vote">
+                        <select v-model="scheme.delegateeId" class="form-control">
+                          <option value="">Select a voter to delegate</option>
+                          <option v-for="voter in scheme.not_delegated_users" :key="voter.id" :value="voter.id">
+                            {{ voter.username }}
+                          </option>
+                        </select>
+                        <button @click="showDelegationWarning(scheme)" class="btn btn-primary mt-2">
+                          Delegate Vote
+                        </button>
+                      </div>
+                    </div>
+                    <div v-else>
+                      <div class="progress">
+                        <div
+                          class="progress-bar bg-success"
+                          role="progressbar"
+                          :style="'width:' + scheme.trueVotePercentage + '%'"
+                        >
+                          <span>{{ scheme.trueVotePercentage.toFixed(2) }}%</span>
+                        </div>
+                        <div
+                          class="progress-bar bg-danger"
+                          role="progressbar"
+                          :style="'width:' + scheme.falseVotePercentage + '%'"
+                        >
+                          <span>{{ scheme.falseVotePercentage.toFixed(2) }}%</span>
+                        </div>
+                      </div>
+                      <p>You have delegated your vote for this scheme to {{ scheme.delegated_to.username }}</p>
+                    </div>
+                    
+                    <button @click="getDelegationChain(scheme.id)" class="btn btn-info mt-2">View Delegation Chain</button>
+                    <button @click="getVotingPowerDistribution(scheme.id)" class="btn btn-secondary mt-2">View Voting Power Distribution</button>
+                    
+                    <canvas :id="'votingPowerChart' + scheme.id" class="mt-3"></canvas>
+                  </li>
+                </ul>
+              </div>
+            </div>
+            
+            <!-- System security information -->
+            <div class="mt-4">
+              <h4>System Security Information</h4>
+              <p>Security Strength: {{ securityStrength }} bits</p>
+              <p>Probability of Successful Attack: {{ attackProbability.toExponential(2) }}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Delegation Warning Modal -->
+      <transition name="modal">
+        <div class="modal-mask" v-if="showWarning">
+          <div class="modal-wrapper">
+            <div class="modal-container">
+              <div class="modal-header">
+                <h3>Warning</h3>
+              </div>
+              <div class="modal-body">
+                <p>Warning: Once you delegate your vote, it cannot be undone. Are you sure you want to proceed?</p>
+              </div>
+              <div class="modal-footer">
+                <button class="btn btn-secondary" @click="closeWarning">
+                  Cancel
+                </button>
+                <button class="btn btn-primary" @click="confirmDelegation">
+                  Confirm Delegation
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </transition>
+    </div>
+  `,
+  data() {
+    return {
+      userRole: localStorage.getItem("role"),
+      token: localStorage.getItem("auth-token"),
+      username: localStorage.getItem("username"),
+      user_id: localStorage.getItem("id"),
+      error: null,
+      schemes: [],
+      showWarning: false,
+      currentScheme: null,
+      securityStrength: 256, // Assuming AES-128
+      attackProbability: Math.pow(2, -256),
+      loading: false,
+    };
+  },
+  methods: {
+    async getSchemes() {
+      this.loading = true;
+      try {
+        const res = await fetch("/scheme/" + this.user_id, {
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+            "Authentication-Token": this.token,
+            "Authentication-Role": this.userRole,
+          },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          this.schemes = data.map(scheme => ({
+            ...scheme,
+            trueVotePercentage: (scheme.true_vote_count / (scheme.true_vote_count + scheme.false_vote_count)) * 100,
+            falseVotePercentage: (scheme.false_vote_count / (scheme.true_vote_count + scheme.false_vote_count)) * 100,
+          }));
+        } else {
+          const data = await res.json();
+          this.error = data.error_message;
+        }
+      } catch (error) {
+        this.error = "An error occurred while fetching schemes.";
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async vote(scheme) {
+      this.loading = true;
+      try {
+        const res = await fetch("/vote", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authentication-Token": this.token,
+            "Authentication-Role": this.userRole,
+          },
+          body: JSON.stringify({
+            scheme_id: scheme.id,
+            user_id: this.user_id,
+            vote: scheme.Vote,
+          }),
+        });
+        if (res.ok) {
+          await this.getSchemes();
+        } else {
+          const data = await res.json();
+          this.error = data.error_message;
+        }
+      } catch (error) {
+        this.error = "An error occurred while voting.";
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    showDelegationWarning(scheme) {
+      if (!scheme.delegateeId) {
+        this.error = "Please select a voter to delegate";
+        return;
+      }
+      this.currentScheme = scheme;
+      this.showWarning = true;
+    },
+
+    closeWarning() {
+      this.showWarning = false;
+      this.currentScheme = null;
+    },
+
+    async confirmDelegation() {
+      if (!this.currentScheme) return;
+      this.loading = true;
+      try {
+        const res = await fetch("/delegation", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authentication-Token": this.token,
+            "Authentication-Role": this.userRole,
+          },
+          body: JSON.stringify({
+            delegator_id: this.user_id,
+            delegatee_id: this.currentScheme.delegateeId,
+            scheme_id: this.currentScheme.id,
+          }),
+        });
+        if (res.ok) {
+          await this.getSchemes();
+          this.closeWarning();
+        } else {
+          const data = await res.json();
+          this.error = data.error_message;
+        }
+      } catch (error) {
+        this.error = "An error occurred while delegating.";
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async getDelegationChain(schemeId) {
+      this.loading = true;
+      try {
+        const res = await fetch(`/delegation-chain/${this.user_id}/${schemeId}`, {
+          headers: {
+            "Authentication-Token": this.token,
+          },
+        });
+        if (res.ok) {
+          const chain = await res.json();
+          alert(`Your delegation chain: ${chain.join(' -> ')}`);
+        } else {
+          const data = await res.json();
+          this.error = data.error_message;
+        }
+      } catch (error) {
+        this.error = "An error occurred while fetching the delegation chain.";
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async getVotingPowerDistribution(schemeId) {
+      this.loading = true;
+      try {
+        const res = await fetch(`/voting-power-distribution/${schemeId}`, {
+          headers: {
+            "Authentication-Token": this.token,
+          },
+        });
+        if (res.ok) {
+          const distribution = await res.json();
+          this.showDistributionChart(distribution, schemeId);
+        } else {
+          const data = await res.json();
+          this.error = data.error_message;
+        }
+      } catch (error) {
+        this.error = "An error occurred while fetching voting power distribution.";
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    showDistributionChart(distribution, schemeId) {
+      const ctx = document.getElementById('votingPowerChart' + schemeId).getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: distribution.labels,
+          datasets: [{
+            label: 'Voting Power',
+            data: distribution.data,
+            backgroundColor: 'rgba(75, 192, 192, 0.6)',
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            y: {
+              beginAtZero: true
+            }
+          }
+        }
+      });
+    },
+  },
+  mounted() {
+    this.getSchemes();
+    document.title = "Voter Home";
+  },
+});
+
+export default Voterhome;
+// File: static/vue/index.js
+import router from "./router.js"
+import Navbar from "./components/navbar.js"
+
+router.beforeEach((to, from, next) => {
+    if (to.name !== 'Login' && to.name !== 'Register' &&  !localStorage.getItem('auth-token') ? true : false)
+      next({ name: 'Login' })
+    else next()
+  })
+
+new Vue ({
+    el: '#app',
+    template: `<div>
+    <Navbar :key='has_changed'/>
+    <router-view/></div>`,
+    router,
+    components: {
+        Navbar,
+      },
+    data: {
+        has_changed: true,
+    },
+    watch: {
+        $route(to, from) {
+          this.has_changed = !this.has_changed
+        },
+      },
+})
+
+// File: static/vue/router.js
+import Home from './components/home.js';
+import About from './components/about.js';
+import Registration from './components/registration.js';
+import Login from './components/login.js';
+
+
+const routes = [
+    {
+        path: '/',
+        component: Home,
+        name: 'Home'
+    },
+    {
+        path: '/about',
+        component: About,
+        name: 'About'
+    },
+    {
+        path: '/register',
+        component: Registration,
+        name: 'Register'
+    },
+    {
+        path: '/login',
+        component: Login,
+        name: 'Login'
+    },
+    {
+        path: "*",
+        redirect: "/"
+    }
+];
+
+const router = new VueRouter({
+    routes,
+});
+
+export default router;
+// File: templates/index.html
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LIQUID DEMOCRACY</title>
+    <link href="https://fonts.cdnfonts.com/css/mystical" rel="stylesheet">    
+    <link rel="stylesheet" href="{{url_for('static', filename='style.css')}}">
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN"
+      crossorigin="anonymous"
+    />
+     <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.15.1/css/all.css"
+        integrity="sha384-vp86vTRFVJgpjF9jiIGPEEqYqlDwgyBgEF109VFjmqGmIY/Y4HV4d3Gp2irVfcrp" crossorigin="anonymous"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.18.0/font/bootstrap-icons.css">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Poppins&display=swap');
+  </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="https://cdn.jsdelivr.net/npm/vue@2.7.16"></script>
+    <script src="https://unpkg.com/vue-router@3.0.0/dist/vue-router.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.3.2/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script
+      src="{{url_for('static', filename='vue/index.js')}}"
+      type="module"
+    ></script>
+    <script
+    src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL"
+    crossorigin="anonymous"
+  ></script>
+   </body>
+</html>
+
