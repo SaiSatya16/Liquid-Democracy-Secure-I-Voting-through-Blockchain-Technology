@@ -536,7 +536,7 @@ load_dotenv()
 # Load environment variables
 INFURA_URL = 'http://localhost:8545'  # Updated to use local Ganache
 PRIVATE_KEY = os.getenv('PRIVATE_KEY', '0x40ebed728dfb45ebef989f0b65e378be0a97e1df8c9699046ec146a94eeeae9a')
-CONTRACT_ADDRESS =  '0x4b61a9D83B89c6C92e89fB6b8BF4Ec7fF8d01143'
+CONTRACT_ADDRESS =  '0x6eDE39444B689F059A49Cb7302281E09CBde8d25'
 
 # Initialize Web3
 w3 = Web3(Web3.HTTPProvider(INFURA_URL))
